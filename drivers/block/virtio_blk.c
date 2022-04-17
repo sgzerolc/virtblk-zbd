@@ -89,13 +89,30 @@ struct virtblk_req {
 	struct scatterlist sg[];
 };
 
-static inline blk_status_t virtblk_result(struct virtblk_req *vbr)
+struct virtblk_zoned_req {
+	struct virtio_blk_zoned_outhdr out_hdr;
+	struct zoned_status {
+		u64 append_sector;
+		u8 reserved[3];
+		u8 status;
+	} zs;
+	struct sg_table sg_table;
+	struct scatterlist sg[];
+};
+
+static inline blk_status_t virtblk_result(u8 status)
 {
-	switch (vbr->status) {
+	switch (status) {
 	case VIRTIO_BLK_S_OK:
 		return BLK_STS_OK;
 	case VIRTIO_BLK_S_UNSUPP:
 		return BLK_STS_NOTSUPP;
+	case VIRTIO_BLK_S_ZONE_OPEN_RESOURCE:
+		return BLK_STS_ZONE_OPEN_RESOURCE;
+	case VIRTIO_BLK_S_ZONE_ACTIVE_RESOURCE:
+		return BLK_STS_ZONE_ACTIVE_RESOURCE;
+	case VIRTIO_BLK_S_IOERR:
+	case VIRTIO_BLK_S_ZONE_UNALIGNED_WP:
 	default:
 		return BLK_STS_IOERR;
 	}
@@ -257,7 +274,7 @@ static inline void virtblk_request_done(struct request *req)
 
 	virtblk_unmap_data(req, vbr);
 	virtblk_cleanup_cmd(req);
-	blk_mq_end_request(req, virtblk_result(vbr));
+	blk_mq_end_request(req, virtblk_result(vbr->status));
 }
 
 static void virtblk_done(struct virtqueue *vq)
@@ -444,6 +461,515 @@ static void virtio_queue_rqs(struct request **rqlist)
 	*rqlist = requeue_list;
 }
 
+#ifdef CONFIG_BLK_DEV_ZONED
+
+static int virtblk_add_zoned_req(struct virtqueue *vq,
+				  struct virtblk_zoned_req *vbr)
+{
+	struct scatterlist hdr, zs, *sgs[3];
+	unsigned int num_out = 0, num_in = 0;
+
+	sg_init_one(&hdr, &vbr->out_hdr, sizeof(vbr->out_hdr));
+	sgs[num_out++] = &hdr;
+
+	if (vbr->sg_table.nents) {
+		if (vbr->out_hdr.type & cpu_to_virtio32(vq->vdev, VIRTIO_BLK_T_OUT))
+			sgs[num_out++] = vbr->sg_table.sgl;
+		else
+			sgs[num_out + num_in++] = vbr->sg_table.sgl;
+	}
+
+	sg_init_one(&zs, &vbr->zs, sizeof(vbr->zs));
+	sgs[num_out + num_in++] = &zs;
+
+	return virtqueue_add_sgs(vq, sgs, num_out, num_in, vbr, GFP_ATOMIC);
+}
+
+
+static void virtblk_zoned_unmap_data(struct request *req,
+				      struct virtblk_zoned_req *vbr)
+{
+	if (blk_rq_nr_phys_segments(req))
+		sg_free_table_chained(&vbr->sg_table,
+				      VIRTIO_BLK_INLINE_SG_CNT);
+}
+
+static int virtblk_zoned_map_data(struct blk_mq_hw_ctx *hctx,
+				   struct request *req,
+				   struct virtblk_zoned_req *vbr)
+{
+	int err;
+
+	if (!blk_rq_nr_phys_segments(req))
+		return 0;
+
+	vbr->sg_table.sgl = vbr->sg;
+	err = sg_alloc_table_chained(&vbr->sg_table,
+				     blk_rq_nr_phys_segments(req),
+				     vbr->sg_table.sgl,
+				     VIRTIO_BLK_INLINE_SG_CNT);
+	if (unlikely(err))
+		return -ENOMEM;
+
+	return blk_rq_map_sg(hctx->queue, req, vbr->sg_table.sgl);
+}
+
+static blk_status_t virtblk_setup_zoned_cmd(struct virtio_device *vdev,
+					     struct request *req,
+					     struct virtblk_zoned_req *vbr)
+{
+	u64 sector = blk_rq_pos(req);
+	u32 type;
+
+	vbr->out_hdr.flags = 0;
+	switch (req_op(req)) {
+	case REQ_OP_ZONE_RESET_ALL:
+		vbr->out_hdr.flags |= VIRTIO_BLK_ZONED_FLAG_ALL;
+		sector = 0;
+		fallthrough;
+	case REQ_OP_ZONE_RESET:
+		type = VIRTIO_BLK_T_ZONE_RESET;
+		break;
+	case REQ_OP_ZONE_OPEN:
+		type = VIRTIO_BLK_T_ZONE_OPEN;
+		break;
+	case REQ_OP_ZONE_CLOSE:
+		type = VIRTIO_BLK_T_ZONE_CLOSE;
+		break;
+	case REQ_OP_ZONE_FINISH:
+		type = VIRTIO_BLK_T_ZONE_FINISH;
+		break;
+	case REQ_OP_ZONE_APPEND:
+		type = VIRTIO_BLK_T_ZONE_APPEND;
+		break;
+	case REQ_OP_DRV_IN:
+		/*
+		 * Set up the internal VIRTIO_BLK_T_ZONE_REPORT request that
+		 * is initiated from virtblk_submit_zone_report() here. Fall
+		 * through to let VIRTIO_BLK_T_GET_ID to be set up
+		 * in virtblk_setup_cmd().
+		 */
+		type = vbr->out_hdr.type;
+		if (type == VIRTIO_BLK_T_ZONE_REPORT) {
+			sector = vbr->out_hdr.sector;
+			break;
+		}
+		fallthrough;
+	default:
+		return virtblk_setup_cmd(vdev, req, (struct virtblk_req *)vbr);
+	}
+
+	vbr->out_hdr.type = cpu_to_virtio32(vdev, type);
+	vbr->out_hdr.ioprio = cpu_to_virtio32(vdev, req_get_ioprio(req));
+	vbr->out_hdr.sector = cpu_to_virtio64(vdev, sector);
+
+	return 0;
+}
+
+static inline void virtblk_zoned_request_done(struct request *req)
+{
+	struct virtblk_zoned_req *vbr = blk_mq_rq_to_pdu(req);
+	int status = virtblk_result(vbr->zs.status);
+
+	virtblk_zoned_unmap_data(req, vbr);
+
+	if (req_op(req) == REQ_OP_ZONE_APPEND) {
+		if (status == BLK_STS_OK)
+			req->__sector = le64_to_cpu(vbr->zs.append_sector);
+		else
+			req->__sector = 0;
+	}
+
+	virtblk_cleanup_cmd(req);
+	blk_mq_end_request(req, status);
+}
+
+static blk_status_t virtblk_prep_zoned_rq(struct blk_mq_hw_ctx *hctx,
+					   struct virtio_blk *vblk,
+					   struct request *req,
+					   struct virtblk_zoned_req *vbr)
+{
+	blk_status_t status;
+
+	status = virtblk_setup_zoned_cmd(vblk->vdev, req, vbr);
+	if (unlikely(status))
+		return status;
+
+	blk_mq_start_request(req);
+
+	vbr->sg_table.nents = virtblk_zoned_map_data(hctx, req, vbr);
+	if (unlikely(vbr->sg_table.nents < 0))
+		return virtblk_fail_to_queue(req, -ENOMEM);
+
+	return BLK_STS_OK;
+}
+
+static blk_status_t virtio_queue_zoned_rq(struct blk_mq_hw_ctx *hctx,
+					   const struct blk_mq_queue_data *bd)
+{
+	struct virtio_blk *vblk = hctx->queue->queuedata;
+	struct request *req = bd->rq;
+	struct virtblk_zoned_req *vbr = blk_mq_rq_to_pdu(req);
+	unsigned long flags;
+	int qid = hctx->queue_num;
+	bool notify = false;
+	blk_status_t status;
+	int err;
+
+	status = virtblk_prep_zoned_rq(hctx, vblk, req, vbr);
+	if (unlikely(status))
+		return status;
+
+	spin_lock_irqsave(&vblk->vqs[qid].lock, flags);
+	err = virtblk_add_zoned_req(vblk->vqs[qid].vq, vbr);
+	if (err) {
+		virtqueue_kick(vblk->vqs[qid].vq);
+		/*
+		 * Don't stop the queue if -ENOMEM: we may have failed to
+		 * bounce the buffer due to global resource outage.
+		 */
+		if (err == -ENOSPC)
+			blk_mq_stop_hw_queue(hctx);
+		spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
+		virtblk_zoned_unmap_data(req, vbr);
+		return virtblk_fail_to_queue(req, err);
+	}
+
+	if (bd->last && virtqueue_kick_prepare(vblk->vqs[qid].vq))
+		notify = true;
+	spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
+
+	if (notify)
+		virtqueue_notify(vblk->vqs[qid].vq);
+	return BLK_STS_OK;
+}
+
+static bool virtblk_prep_zoned_rq_batch(struct request *req)
+{
+	struct virtio_blk *vblk = req->mq_hctx->queue->queuedata;
+	struct virtblk_zoned_req *vbr = blk_mq_rq_to_pdu(req);
+
+	req->mq_hctx->tags->rqs[req->tag] = req;
+
+	return virtblk_prep_zoned_rq(req->mq_hctx, vblk, req, vbr) == BLK_STS_OK;
+}
+
+static bool virtblk_add_zoned_req_batch(struct virtio_blk_vq *vq,
+					 struct request **rqlist,
+					 struct request **requeue_list)
+{
+	unsigned long flags;
+	int err;
+	bool kick;
+
+	spin_lock_irqsave(&vq->lock, flags);
+
+	while (!rq_list_empty(*rqlist)) {
+		struct request *req = rq_list_pop(rqlist);
+		struct virtblk_zoned_req *vbr = blk_mq_rq_to_pdu(req);
+
+		err = virtblk_add_zoned_req(vq->vq, vbr);
+		if (err) {
+			virtblk_zoned_unmap_data(req, vbr);
+			virtblk_cleanup_cmd(req);
+			rq_list_add(requeue_list, req);
+		}
+	}
+
+	kick = virtqueue_kick_prepare(vq->vq);
+	spin_unlock_irqrestore(&vq->lock, flags);
+
+	return kick;
+}
+
+static void virtio_queue_zoned_rqs(struct request **rqlist)
+{
+	struct request *req, *next, *prev = NULL;
+	struct request *requeue_list = NULL;
+
+	rq_list_for_each_safe(rqlist, req, next) {
+		struct virtio_blk_vq *vq = req->mq_hctx->driver_data;
+		bool kick;
+
+		if (!virtblk_prep_zoned_rq_batch(req)) {
+			rq_list_move(rqlist, &requeue_list, req, prev);
+			req = prev;
+			if (!req)
+				continue;
+		}
+
+		if (!next || req->mq_hctx != next->mq_hctx) {
+			req->rq_next = NULL;
+			kick = virtblk_add_zoned_req_batch(vq, rqlist,
+							&requeue_list);
+			if (kick)
+				virtqueue_notify(vq->vq);
+
+			*rqlist = next;
+			prev = NULL;
+		} else
+			prev = req;
+	}
+
+	*rqlist = requeue_list;
+}
+
+static void *virtblk_alloc_report_buffer(struct virtio_blk *vblk,
+					  unsigned int nr_zones,
+					  unsigned int zone_sectors,
+					  size_t *buflen)
+{
+	struct request_queue *q = vblk->disk->queue;
+	size_t bufsize;
+	void *buf;
+
+	nr_zones = min_t(unsigned int, nr_zones,
+			 get_capacity(vblk->disk) >> ilog2(zone_sectors));
+
+	bufsize = sizeof(struct virtio_blk_zone_report) +
+		nr_zones * sizeof(struct virtio_blk_zone_descriptor);
+	bufsize = min_t(size_t, bufsize,
+			queue_max_hw_sectors(q) << SECTOR_SHIFT);
+	bufsize = min_t(size_t, bufsize, queue_max_segments(q) << PAGE_SHIFT);
+
+	while (bufsize >= sizeof(struct virtio_blk_zone_report)) {
+		buf = __vmalloc(bufsize, GFP_KERNEL | __GFP_NORETRY);
+		if (buf) {
+			*buflen = bufsize;
+			return buf;
+		}
+		bufsize >>= 1;
+	}
+	return NULL;
+}
+
+static int virtblk_submit_zone_report(struct virtio_blk *vblk,
+				       char *report_buf, size_t report_len,
+				       sector_t sector)
+{
+	struct request_queue *q = vblk->disk->queue;
+	struct request *req;
+	struct virtblk_zoned_req *vbr;
+	int err;
+
+	req = blk_mq_alloc_request(q, REQ_OP_DRV_IN, 0);
+	if (IS_ERR(req))
+		return PTR_ERR(req);
+
+	vbr = blk_mq_rq_to_pdu(req);
+	vbr->out_hdr.type = VIRTIO_BLK_T_ZONE_REPORT;
+	vbr->out_hdr.sector = sector;
+
+	err = blk_rq_map_kern(q, req, report_buf, report_len, GFP_KERNEL);
+	if (err)
+		goto out;
+
+	blk_execute_rq(req, false);
+	err = blk_status_to_errno(virtblk_result(vbr->zs.status));
+out:
+	blk_mq_free_request(req);
+	return err;
+}
+
+static int virtblk_parse_zone(struct virtio_blk *vblk,
+			       struct virtio_blk_zone_descriptor *entry,
+			       unsigned int idx, unsigned int zone_sectors,
+			       report_zones_cb cb, void *data)
+{
+	struct blk_zone zone = { };
+
+	if (entry->z_type != VIRTIO_BLK_ZT_SWR &&
+	    entry->z_type != VIRTIO_BLK_ZT_SWP &&
+	    entry->z_type != VIRTIO_BLK_ZT_CONV) {
+		dev_err(&vblk->vdev->dev, "invalid zone type %#x\n",
+			entry->z_type);
+		return -EINVAL;
+	}
+
+	zone.type = entry->z_type;
+	zone.cond = entry->z_state;
+	zone.len = zone_sectors;
+	zone.capacity = le64_to_cpu(entry->z_cap);
+	zone.start = le64_to_cpu(entry->z_start);
+	if (zone.cond == BLK_ZONE_COND_FULL)
+		zone.wp = zone.start + zone.len;
+	else
+		zone.wp = le64_to_cpu(entry->z_wp);
+
+	return cb(&zone, idx, data);
+}
+
+static int virtblk_report_zones(struct gendisk *disk, sector_t sector,
+				 unsigned int nr_zones, report_zones_cb cb,
+				 void *data)
+{
+	struct virtio_blk *vblk = disk->private_data;
+	struct virtio_blk_zone_report *report;
+	size_t buflen;
+	unsigned int zone_sectors, nz, i;
+	int ret, zone_idx = 0;
+
+	if (!virtio_has_feature(vblk->vdev, VIRTIO_BLK_F_ZONED))
+		return -EINVAL;
+
+	virtio_cread(vblk->vdev, struct virtio_blk_config,
+		     zoned.zone_sectors, &zone_sectors);
+
+	report = virtblk_alloc_report_buffer(vblk, nr_zones,
+					     zone_sectors, &buflen);
+	if (!report)
+		return -ENOMEM;
+
+	sector &= ~(zone_sectors - 1);
+	while (zone_idx < nr_zones && sector < get_capacity(vblk->disk)) {
+		memset(report, 0, buflen);
+
+		ret = virtblk_submit_zone_report(vblk, (char *)report,
+						 buflen, sector);
+		if (ret) {
+			if (ret > 0)
+				ret = -EIO;
+			goto out_free;
+		}
+
+		nz = min((unsigned int)le64_to_cpu(report->nr_zones), nr_zones);
+		if (!nz)
+			break;
+
+		for (i = 0; i < nz && zone_idx < nr_zones; i++) {
+			ret = virtblk_parse_zone(vblk, &report->zones[i],
+						 zone_idx, zone_sectors, cb, data);
+			if (ret)
+				goto out_free;
+			zone_idx++;
+		}
+
+		sector += zone_sectors * nz;
+	}
+
+	if (zone_idx > 0)
+		ret = zone_idx;
+	else
+		ret = -EINVAL;
+out_free:
+	kvfree(report);
+	return ret;
+}
+
+static void virtblk_revalidate_zones(struct virtio_blk *vblk)
+{
+	u8 model;
+
+	if (!virtio_has_feature(vblk->vdev, VIRTIO_BLK_F_ZONED))
+		return;
+
+	virtio_cread(vblk->vdev, struct virtio_blk_config,
+		     zoned.model, &model);
+	if (!blk_revalidate_disk_zones(vblk->disk, NULL))
+		set_capacity_and_notify(vblk->disk, 0);
+}
+
+static int virtblk_probe_zoned_device(struct virtio_device *vdev,
+				       struct virtio_blk *vblk,
+				       struct request_queue *q)
+{
+	u32 v, max_za;
+	u8 model;
+	int err;
+
+	virtio_cread(vdev, struct virtio_blk_config,
+		     zoned.model, &model);
+	switch (model) {
+	case VIRTIO_BLK_Z_HM:
+		blk_queue_set_zoned(vblk->disk, BLK_ZONED_HM);
+
+		blk_queue_flag_set(QUEUE_FLAG_ZONE_RESETALL, q);
+
+		virtio_cread(vdev, struct virtio_blk_config,
+			     zoned.max_open_zones, &v);
+		blk_queue_max_open_zones(q, le32_to_cpu(v));
+		virtio_cread(vdev, struct virtio_blk_config,
+			     zoned.max_active_zones, &v);
+		blk_queue_max_active_zones(q, le32_to_cpu(v));
+
+		err = blk_revalidate_disk_zones(vblk->disk, NULL);
+		if (err)
+			return err;
+
+		virtio_cread(vdev, struct virtio_blk_config,
+			     zoned.max_append_sectors, &v);
+		if (!v) {
+			dev_warn(&vdev->dev, "zero max_append_sectors reported\n");
+		} else {
+			max_za = queue_max_segments(q) * queue_max_segment_size(q);
+			if (v > max_za) {
+				dev_err(&vdev->dev, "max_append_sectors %u exceeds %u limit\n",
+					le32_to_cpu(v), max_za);
+				return -EINVAL;
+			}
+		}
+		blk_queue_max_zone_append_sectors(q, le32_to_cpu(v));
+
+		virtio_cread(vdev, struct virtio_blk_config,
+			     zoned.write_granularity, &v);
+		if (v) {
+			blk_queue_physical_block_size(q, le32_to_cpu(v));
+			blk_queue_io_min(q, le32_to_cpu(v));
+		}
+		break;
+	case VIRTIO_BLK_Z_HA:
+		/*
+		 * Present the host-aware device as a regular drive.
+		 * TODO It is possible to add an option to make it appear
+		 * in the system as a zoned drive.
+		 */
+		break;
+	default:
+		dev_err(&vdev->dev, "unsupported zone model %d\n", model);
+		return -EINVAL;
+	}
+
+	/*
+	 * virtio ZBD specification doesn't require zones to be a power of
+	 * two sectors in size, but the code in this driver expects that.
+	 */
+	virtio_cread(vdev, struct virtio_blk_config,
+		     zoned.zone_sectors, &v);
+	if (v == 0 || !is_power_of_2(v)) {
+		dev_err(&vdev->dev,
+			"zoned device with non power of two zone size %u\n", v);
+		return -ENODEV;
+	}
+
+	if (virtio_has_feature(vdev, VIRTIO_BLK_F_DISCARD)) {
+		dev_warn(&vblk->vdev->dev,
+			 "ignoring negotiated F_DISCARD for zoned device\n");
+		blk_queue_max_discard_sectors(q, 0);
+	}
+
+	return BLK_STS_OK;
+}
+
+#else
+
+/*
+ * Zoned block device support is not configured in this kernel.
+ * We only need to define a few symbols to avoid compilation errors.
+ */
+#define virtblk_report_zones       NULL
+#define virtio_queue_zoned_rq      NULL
+#define virtio_queue_zoned_rqs     NULL
+#define virtblk_zoned_request_done NULL
+static inline void virtblk_revalidate_zones(struct virtio_blk *vblk)
+{
+}
+static inline int virtblk_probe_zoned_device(struct virtio_device *vdev,
+			struct virtio_blk *vblk, struct request_queue *q)
+{
+	return BLK_STS_OK;
+}
+#endif /* CONFIG_BLK_DEV_ZONED */
+
 /* return id (s/n) string for *disk to *id_str
  */
 static int virtblk_get_id(struct gendisk *disk, char *id_str)
@@ -452,6 +978,7 @@ static int virtblk_get_id(struct gendisk *disk, char *id_str)
 	struct request_queue *q = vblk->disk->queue;
 	struct request *req;
 	int err;
+	u8 status;
 
 	req = blk_mq_alloc_request(q, REQ_OP_DRV_IN, 0);
 	if (IS_ERR(req))
@@ -462,7 +989,11 @@ static int virtblk_get_id(struct gendisk *disk, char *id_str)
 		goto out;
 
 	blk_execute_rq(req, false);
-	err = blk_status_to_errno(virtblk_result(blk_mq_rq_to_pdu(req)));
+	if (!virtio_has_feature(vblk->vdev, VIRTIO_BLK_F_ZONED))
+		status = ((struct virtblk_req *)blk_mq_rq_to_pdu(req))->status;
+	else
+		status = ((struct virtblk_zoned_req *)blk_mq_rq_to_pdu(req))->zs.status;
+	err = blk_status_to_errno(virtblk_result(status));
 out:
 	blk_mq_free_request(req);
 	return err;
@@ -513,6 +1044,7 @@ static const struct block_device_operations virtblk_fops = {
 	.owner  	= THIS_MODULE,
 	.getgeo		= virtblk_getgeo,
 	.free_disk	= virtblk_free_disk,
+	.report_zones = virtblk_report_zones,
 };
 
 static int index_to_minor(int index)
@@ -583,6 +1115,7 @@ static void virtblk_config_changed_work(struct work_struct *work)
 	struct virtio_blk *vblk =
 		container_of(work, struct virtio_blk, config_work);
 
+	virtblk_revalidate_zones(vblk);
 	virtblk_update_capacity(vblk, true);
 }
 
@@ -886,6 +1419,16 @@ static const struct blk_mq_ops virtio_mq_ops = {
 	.poll		= virtblk_poll,
 };
 
+static const struct blk_mq_ops virtio_mq_zoned_ops = {
+	.queue_rq	= virtio_queue_zoned_rq,
+	.queue_rqs	= virtio_queue_zoned_rqs,
+	.commit_rqs	= virtio_commit_rqs,
+	.init_hctx	= virtblk_init_hctx,
+	.complete	= virtblk_zoned_request_done,
+	.map_queues	= virtblk_map_queues,
+	.poll		= virtblk_poll,
+};
+
 static unsigned int virtblk_queue_depth;
 module_param_named(queue_depth, virtblk_queue_depth, uint, 0444);
 
@@ -951,13 +1494,18 @@ static int virtblk_probe(struct virtio_device *vdev)
 	}
 
 	memset(&vblk->tag_set, 0, sizeof(vblk->tag_set));
-	vblk->tag_set.ops = &virtio_mq_ops;
 	vblk->tag_set.queue_depth = queue_depth;
 	vblk->tag_set.numa_node = NUMA_NO_NODE;
 	vblk->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
-	vblk->tag_set.cmd_size =
-		sizeof(struct virtblk_req) +
-		sizeof(struct scatterlist) * VIRTIO_BLK_INLINE_SG_CNT;
+	if (virtio_has_feature(vdev, VIRTIO_BLK_F_ZONED)) {
+		vblk->tag_set.ops = &virtio_mq_zoned_ops;
+		vblk->tag_set.cmd_size = sizeof(struct virtblk_zoned_req);
+	} else {
+		vblk->tag_set.ops = &virtio_mq_ops;
+		vblk->tag_set.cmd_size = sizeof(struct virtblk_req);
+	};
+	vblk->tag_set.cmd_size +=
+			sizeof(struct scatterlist) * VIRTIO_BLK_INLINE_SG_CNT;
 	vblk->tag_set.driver_data = vblk;
 	vblk->tag_set.nr_hw_queues = vblk->num_vqs;
 	vblk->tag_set.nr_maps = 1;
@@ -1082,6 +1630,12 @@ static int virtblk_probe(struct virtio_device *vdev)
 		blk_queue_max_write_zeroes_sectors(q, v ? v : UINT_MAX);
 	}
 
+	if (virtio_has_feature(vdev, VIRTIO_BLK_F_ZONED)) {
+		err = virtblk_probe_zoned_device(vdev, vblk, q);
+		if (err)
+			return err;
+	}
+
 	virtblk_update_capacity(vblk, false);
 	virtio_device_ready(vdev);
 
@@ -1185,6 +1739,9 @@ static unsigned int features[] = {
 	VIRTIO_BLK_F_RO, VIRTIO_BLK_F_BLK_SIZE,
 	VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_TOPOLOGY, VIRTIO_BLK_F_CONFIG_WCE,
 	VIRTIO_BLK_F_MQ, VIRTIO_BLK_F_DISCARD, VIRTIO_BLK_F_WRITE_ZEROES,
+#ifdef CONFIG_BLK_DEV_ZONED
+	VIRTIO_BLK_F_ZONED,
+#endif /* CONFIG_BLK_DEV_ZONED */
 };
 
 static struct virtio_driver virtio_blk = {
