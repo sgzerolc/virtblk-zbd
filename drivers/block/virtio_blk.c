@@ -1630,7 +1630,7 @@ static int virtblk_probe(struct virtio_device *vdev)
 	if (virtio_has_feature(vdev, VIRTIO_BLK_F_ZONED)) {
 		err = virtblk_probe_zoned_device(vdev, vblk, q);
 		if (err)
-			return err;
+			goto out_cleanup_disk;
 	}
 
 	virtblk_update_capacity(vblk, false);
