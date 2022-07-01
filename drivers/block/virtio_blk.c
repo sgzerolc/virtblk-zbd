@@ -810,7 +810,7 @@ static int virtblk_report_zones(struct gendisk *disk, sector_t sector,
 	int ret, zone_idx = 0;
 
 	if (!virtio_has_feature(vblk->vdev, VIRTIO_BLK_F_ZONED))
-		return -EINVAL;
+		return -EOPNOTSUPP;
 
 	virtio_cread(vblk->vdev, struct virtio_blk_config,
 		     zoned.zone_sectors, &zone_sectors);
@@ -957,16 +957,13 @@ static int virtblk_probe_zoned_device(struct virtio_device *vdev,
  * We only need to define a few symbols to avoid compilation errors.
  */
 #define virtblk_report_zones       NULL
-#define virtio_queue_zoned_rq      NULL
-#define virtio_queue_zoned_rqs     NULL
-#define virtblk_zoned_request_done NULL
 static inline void virtblk_revalidate_zones(struct virtio_blk *vblk)
 {
 }
 static inline int virtblk_probe_zoned_device(struct virtio_device *vdev,
 			struct virtio_blk *vblk, struct request_queue *q)
 {
-	return BLK_STS_OK;
+	return -EOPNOTSUPP;
 }
 #endif /* CONFIG_BLK_DEV_ZONED */
 
