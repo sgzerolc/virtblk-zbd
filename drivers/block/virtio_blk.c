@@ -947,7 +947,7 @@ static int virtblk_probe_zoned_device(struct virtio_device *vdev,
 		blk_queue_max_discard_sectors(q, 0);
 	}
 
-	return BLK_STS_OK;
+	return 0;
 }
 
 #else
