@@ -1041,7 +1041,7 @@ static const struct block_device_operations virtblk_fops = {
 	.owner  	= THIS_MODULE,
 	.getgeo		= virtblk_getgeo,
 	.free_disk	= virtblk_free_disk,
-	.report_zones = virtblk_report_zones,
+	.report_zones	= virtblk_report_zones,
 };
 
 static int index_to_minor(int index)
