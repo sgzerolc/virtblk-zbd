@@ -220,17 +220,10 @@ struct virtio_blk_outhdr {
 #define VIRTIO_BLK_ZONED_FLAG_ALL	(1 << 0)
 
 /*
- * Request header for zoned devices.
- * The first three fields are identical in layout to
- * struct virtio_blk_outhdr.
+ * Header for VIRTIO_BLK_T_ZONE_OPEN, VIRTIO_BLK_T_ZONE_CLOSE,
+ * VIRTIO_BLK_T_ZONE_RESET, VIRTIO_BLK_T_ZONE_FINISH requests.
  */
-struct virtio_blk_zoned_outhdr {
-	/* VIRTIO_BLK_T* */
-	__virtio32 type;
-	/* io priority. */
-	__virtio32 ioprio;
-	/* Sector (ie. 512 byte offset) */
-	__virtio64 sector;
+struct virtio_blk_zone_mgmt_outhdr {
 	/* Zoned request flags */
 	__virtio32 flags;
 };
