@@ -112,7 +112,6 @@ struct virtblk_req {
 	};
 
 	size_t out_hdr_len;
-	void *in_hdr_ptr;
 	size_t in_hdr_len;
 
 	struct sg_table sg_table;
@@ -152,7 +151,7 @@ static int virtblk_add_req(struct virtqueue *vq, struct virtblk_req *vbr)
 			sgs[num_out + num_in++] = vbr->sg_table.sgl;
 	}
 
-	sg_init_one(&in_hdr, vbr->in_hdr_ptr, vbr->in_hdr_len);
+	sg_init_one(&in_hdr, &vbr->status, vbr->in_hdr_len);
 	sgs[num_out + num_in++] = &in_hdr;
 
 	return virtqueue_add_sgs(vq, sgs, num_out, num_in, vbr, GFP_ATOMIC);
@@ -243,7 +242,6 @@ static blk_status_t virtblk_setup_cmd(struct virtio_device *vdev,
 				      struct virtblk_req *vbr)
 {
 	size_t out_hdr_len = sizeof(vbr->out_hdr);
-	void *in_hdr_ptr = &vbr->status;
 	size_t in_hdr_len = sizeof(vbr->status);
 	bool unmap = false;
 	u32 type;
@@ -292,7 +290,6 @@ static blk_status_t virtblk_setup_cmd(struct virtio_device *vdev,
 	case REQ_OP_ZONE_APPEND:
 		type = VIRTIO_BLK_T_ZONE_APPEND;
 		sector = blk_rq_pos(req);
-		in_hdr_ptr = &vbr->zone_append_in_hdr;
 		in_hdr_len = sizeof(vbr->zone_append_in_hdr);
 		break;
 	case REQ_OP_ZONE_RESET:
@@ -317,7 +314,6 @@ static blk_status_t virtblk_setup_cmd(struct virtio_device *vdev,
 
 	/* Set fields for non-REQ_OP_DRV_IN request types */
 	vbr->out_hdr_len = out_hdr_len;
-	vbr->in_hdr_ptr = in_hdr_ptr;
 	vbr->in_hdr_len = in_hdr_len;
 	vbr->out_hdr.type = cpu_to_virtio32(vdev, type);
 	vbr->out_hdr.sector = cpu_to_virtio64(vdev, sector);
@@ -578,7 +574,6 @@ static int virtblk_submit_zone_report(struct virtio_blk *vblk,
 
 	vbr = blk_mq_rq_to_pdu(req);
 	vbr->out_hdr_len = sizeof(vbr->out_hdr);
-	vbr->in_hdr_ptr = &vbr->status;
 	vbr->in_hdr_len = sizeof(vbr->status);
 	vbr->out_hdr.type = cpu_to_virtio32(vblk->vdev, VIRTIO_BLK_T_ZONE_REPORT);
 	vbr->out_hdr.sector = cpu_to_virtio64(vblk->vdev, sector);
@@ -807,7 +802,6 @@ static int virtblk_get_id(struct gendisk *disk, char *id_str)
 
 	vbr = blk_mq_rq_to_pdu(req);
 	vbr->out_hdr_len = sizeof(vbr->out_hdr);
-	vbr->in_hdr_ptr = &vbr->status;
 	vbr->in_hdr_len = sizeof(vbr->status);
 	vbr->out_hdr.type = cpu_to_virtio32(vblk->vdev, VIRTIO_BLK_T_GET_ID);
 	vbr->out_hdr.sector = 0;
