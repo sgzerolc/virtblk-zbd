@@ -96,16 +96,18 @@ struct virtblk_req {
 
 	/* In header */
 	union {
-		struct {
-			u8 reserved[11];
-			u8 status;
-		};
+		u8 status;
 
-		/* The zone append command has an extended in header */
+		/*
+		 * The zone append command has an extended in header.
+		 * The status field in zone_append_in_hdr must have
+		 * the same offset in virtblk_req as the non-zoned
+		 * status field above.
+		 */
 		struct {
-			u64 append_sector;
-			u8 reserved[3];
 			u8 status;
+			u8 reserved[3];
+			u64 append_sector;
 		} zone_append_in_hdr;
 	};
 
