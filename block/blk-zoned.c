@@ -566,13 +566,19 @@ int blk_revalidate_disk_zones(struct gendisk *disk,
 	unsigned int noio_flag;
 	int ret;
 
-	if (WARN_ON_ONCE(!blk_queue_is_zoned(q)))
+	if (WARN_ON_ONCE(!blk_queue_is_zoned(q))){
+		pr_warn("not zoned\n");
 		return -EIO;
-	if (WARN_ON_ONCE(!queue_is_mq(q)))
+	}
+	if (WARN_ON_ONCE(!queue_is_mq(q))){
+		pr_warn("queue is not mq\n");
 		return -EIO;
+	}
 
-	if (!get_capacity(disk))
+	if (!get_capacity(disk)){
+		pr_warn("no disk get capacity\n");
 		return -EIO;
+	}
 
 	/*
 	 * Ensure that all memory allocations in this context are done as if
@@ -616,6 +622,7 @@ int blk_revalidate_disk_zones(struct gendisk *disk,
 		blk_queue_free_zone_bitmaps(q);
 	}
 	blk_mq_unfreeze_queue(q);
+	pr_info("%s: get there in blk_revalidate_disk_zones\n", disk->disk_name);
 
 	kfree(args.seq_zones_wlock);
 	kfree(args.conv_zones_bitmap);

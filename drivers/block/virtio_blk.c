@@ -542,11 +542,15 @@ static void *virtblk_alloc_report_buffer(struct virtio_blk *vblk,
 	nr_zones = min_t(unsigned int, nr_zones,
 			 get_capacity(vblk->disk) >> ilog2(zone_sectors));
 
+	pr_info("virtblk_alloc_report_buffer: nr_zones = %d\n", nr_zones);
+
 	bufsize = sizeof(struct virtio_blk_zone_report) +
 		nr_zones * sizeof(struct virtio_blk_zone_descriptor);
 	bufsize = min_t(size_t, bufsize,
 			queue_max_hw_sectors(q) << SECTOR_SHIFT);
 	bufsize = min_t(size_t, bufsize, queue_max_segments(q) << PAGE_SHIFT);
+
+	pr_info("virtblk_alloc_report_buffer: bufsize = %d\n", bufsize);
 
 	while (bufsize >= sizeof(struct virtio_blk_zone_report)) {
 		buf = __vmalloc(bufsize, GFP_KERNEL | __GFP_NORETRY);
@@ -639,6 +643,10 @@ static int virtblk_report_zones(struct gendisk *disk, sector_t sector,
 		return -ENOMEM;
 
 	sector &= ~(zone_sectors - 1);
+
+	pr_info("guest os: nr_zones is: %d\n", nr_zones);
+	pr_info("guest os before zone report: %d\n", zone_idx);
+
 	while (zone_idx < nr_zones && sector < get_capacity(vblk->disk)) {
 		memset(report, 0, buflen);
 
@@ -660,6 +668,8 @@ static int virtblk_report_zones(struct gendisk *disk, sector_t sector,
 			if (ret)
 				goto out_free;
 			zone_idx++;
+			pr_info("guest os: reporting zone idx: %d\n", zone_idx);
+		
 		}
 
 		sector += zone_sectors * nz;
@@ -667,8 +677,10 @@ static int virtblk_report_zones(struct gendisk *disk, sector_t sector,
 
 	if (zone_idx > 0)
 		ret = zone_idx;
-	else
+	else {
+		pr_info("guest os error case: report zone: %d\n", zone_idx);
 		ret = -EINVAL;
+	}
 out_free:
 	kvfree(report);
 	return ret;
@@ -683,8 +695,10 @@ static void virtblk_revalidate_zones(struct virtio_blk *vblk)
 
 	virtio_cread(vblk->vdev, struct virtio_blk_config,
 		     zoned.model, &model);
-	if (!blk_revalidate_disk_zones(vblk->disk, NULL))
+	if (!blk_revalidate_disk_zones(vblk->disk, NULL)) {
+		pr_info("virtblk_revalidate_zones, setting capacity\n");
 		set_capacity_and_notify(vblk->disk, 0);
+	}
 }
 
 static int virtblk_probe_zoned_device(struct virtio_device *vdev,
@@ -694,6 +708,18 @@ static int virtblk_probe_zoned_device(struct virtio_device *vdev,
 	u32 v, max_za;
 	u8 model;
 	int err;
+
+	/*
+	 * virtio ZBD specification doesn't require zones to be a power of
+	 * two sectors in size, but the code in this driver expects that.
+	 */
+	virtio_cread(vdev, struct virtio_blk_config,
+		     zoned.zone_sectors, &v);
+	if (v == 0 || !is_power_of_2(v)) {
+		dev_err(&vdev->dev,
+			"zoned device with non power of two zone size %u\n", v);
+		return -ENODEV;
+	}
 
 	virtio_cread(vdev, struct virtio_blk_config,
 		     zoned.model, &model);
@@ -709,10 +735,6 @@ static int virtblk_probe_zoned_device(struct virtio_device *vdev,
 		virtio_cread(vdev, struct virtio_blk_config,
 			     zoned.max_active_zones, &v);
 		blk_queue_max_active_zones(q, le32_to_cpu(v));
-
-		err = blk_revalidate_disk_zones(vblk->disk, NULL);
-		if (err)
-			return err;
 
 		virtio_cread(vdev, struct virtio_blk_config,
 			     zoned.max_append_sectors, &v);
@@ -745,18 +767,6 @@ static int virtblk_probe_zoned_device(struct virtio_device *vdev,
 	default:
 		dev_err(&vdev->dev, "unsupported zone model %d\n", model);
 		return -EINVAL;
-	}
-
-	/*
-	 * virtio ZBD specification doesn't require zones to be a power of
-	 * two sectors in size, but the code in this driver expects that.
-	 */
-	virtio_cread(vdev, struct virtio_blk_config,
-		     zoned.zone_sectors, &v);
-	if (v == 0 || !is_power_of_2(v)) {
-		dev_err(&vdev->dev,
-			"zoned device with non power of two zone size %u\n", v);
-		return -ENODEV;
 	}
 
 	if (virtio_has_feature(vdev, VIRTIO_BLK_F_DISCARD)) {
@@ -1434,18 +1444,27 @@ static int virtblk_probe(struct virtio_device *vdev)
 		blk_queue_max_write_zeroes_sectors(q, v ? v : UINT_MAX);
 	}
 
+	virtblk_update_capacity(vblk, false);
 	if (virtio_has_feature(vdev, VIRTIO_BLK_F_ZONED)) {
 		err = virtblk_probe_zoned_device(vdev, vblk, q);
-		if (err)
+		if (err) {
+			dev_err(&vdev->dev, "virtblk: probing zoned device!\n");
 			goto out_cleanup_disk;
+		}
 	}
 
-	virtblk_update_capacity(vblk, false);
 	virtio_device_ready(vdev);
+
+	err = blk_revalidate_disk_zones(vblk->disk, NULL);
+	if (err) {
+		dev_warn(&vdev->dev, "error occurs in blk_revalidate_disk_zones\n");
+		return err;
+	}
 
 	err = device_add_disk(&vdev->dev, vblk->disk, virtblk_attr_groups);
 	if (err)
 		goto out_cleanup_disk;
+			
 
 	return 0;
 
