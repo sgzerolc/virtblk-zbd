@@ -1445,21 +1445,22 @@ static int virtblk_probe(struct virtio_device *vdev)
 	}
 
 	virtblk_update_capacity(vblk, false);
+	virtio_device_ready(vdev);
+	
 	if (virtio_has_feature(vdev, VIRTIO_BLK_F_ZONED)) {
 		err = virtblk_probe_zoned_device(vdev, vblk, q);
 		if (err) {
 			dev_err(&vdev->dev, "virtblk: probing zoned device!\n");
 			goto out_cleanup_disk;
 		}
+
+		err = blk_revalidate_disk_zones(vblk->disk, NULL);
+		if (err) {
+			dev_warn(&vdev->dev, "error occurs in blk_revalidate_disk_zones\n");
+			return err;
+		}
 	}
 
-	virtio_device_ready(vdev);
-
-	err = blk_revalidate_disk_zones(vblk->disk, NULL);
-	if (err) {
-		dev_warn(&vdev->dev, "error occurs in blk_revalidate_disk_zones\n");
-		return err;
-	}
 
 	err = device_add_disk(&vdev->dev, vblk->disk, virtblk_attr_groups);
 	if (err)
