@@ -80,6 +80,9 @@ struct virtio_blk {
 	int num_vqs;
 	int io_queues[HCTX_MAX_TYPES];
 	struct virtio_blk_vq *vqs;
+
+	/* For zoned device */
+	unsigned int zone_sectors;
 };
 
 struct virtblk_req {
@@ -623,15 +626,13 @@ static int virtblk_report_zones(struct gendisk *disk, sector_t sector,
 {
 	struct virtio_blk *vblk = disk->private_data;
 	struct virtio_blk_zone_report *report;
-	size_t buflen;
-	unsigned int zone_sectors, nz, i;
+	unsigned int zone_sectors = vblk->zone_sectors;
+	unsigned int nz, i;
 	int ret, zone_idx = 0;
+	size_t buflen;
 
-	if (!virtio_has_feature(vblk->vdev, VIRTIO_BLK_F_ZONED))
+	if (WARN_ON_ONCE(!vblk->zone_sectors))
 		return -EOPNOTSUPP;
-
-	virtio_cread(vblk->vdev, struct virtio_blk_config,
-		     zoned.zone_sectors, &zone_sectors);
 
 	report = virtblk_alloc_report_buffer(vblk, nr_zones,
 					     zone_sectors, &buflen);
@@ -678,7 +679,7 @@ static void virtblk_revalidate_zones(struct virtio_blk *vblk)
 {
 	u8 model;
 
-	if (!virtio_has_feature(vblk->vdev, VIRTIO_BLK_F_ZONED))
+	if (!vblk->zone_sectors)
 		return;
 
 	virtio_cread(vblk->vdev, struct virtio_blk_config,
@@ -691,49 +692,16 @@ static int virtblk_probe_zoned_device(struct virtio_device *vdev,
 				       struct virtio_blk *vblk,
 				       struct request_queue *q)
 {
-	u32 v, max_za;
+	u32 v;
 	u8 model;
-	int err;
 
 	virtio_cread(vdev, struct virtio_blk_config,
 		     zoned.model, &model);
+
 	switch (model) {
+	case VIRTIO_BLK_Z_NONE:
+		return 0;
 	case VIRTIO_BLK_Z_HM:
-		blk_queue_set_zoned(vblk->disk, BLK_ZONED_HM);
-
-		blk_queue_flag_set(QUEUE_FLAG_ZONE_RESETALL, q);
-
-		virtio_cread(vdev, struct virtio_blk_config,
-			     zoned.max_open_zones, &v);
-		blk_queue_max_open_zones(q, le32_to_cpu(v));
-		virtio_cread(vdev, struct virtio_blk_config,
-			     zoned.max_active_zones, &v);
-		blk_queue_max_active_zones(q, le32_to_cpu(v));
-
-		err = blk_revalidate_disk_zones(vblk->disk, NULL);
-		if (err)
-			return err;
-
-		virtio_cread(vdev, struct virtio_blk_config,
-			     zoned.max_append_sectors, &v);
-		if (!v) {
-			dev_warn(&vdev->dev, "zero max_append_sectors reported\n");
-		} else {
-			max_za = queue_max_segments(q) * queue_max_segment_size(q);
-			if (v > max_za) {
-				dev_err(&vdev->dev, "max_append_sectors %u exceeds %u limit\n",
-					le32_to_cpu(v), max_za);
-				return -EINVAL;
-			}
-		}
-		blk_queue_max_zone_append_sectors(q, le32_to_cpu(v));
-
-		virtio_cread(vdev, struct virtio_blk_config,
-			     zoned.write_granularity, &v);
-		if (v) {
-			blk_queue_physical_block_size(q, le32_to_cpu(v));
-			blk_queue_io_min(q, le32_to_cpu(v));
-		}
 		break;
 	case VIRTIO_BLK_Z_HA:
 		/*
@@ -741,23 +709,63 @@ static int virtblk_probe_zoned_device(struct virtio_device *vdev,
 		 * TODO It is possible to add an option to make it appear
 		 * in the system as a zoned drive.
 		 */
-		break;
+		return 0;
 	default:
 		dev_err(&vdev->dev, "unsupported zone model %d\n", model);
 		return -EINVAL;
 	}
 
+	dev_info(&vdev->dev, "Probing host-managed zoned device\n");
+
+	blk_queue_set_zoned(vblk->disk, BLK_ZONED_HM);
+	blk_queue_flag_set(QUEUE_FLAG_ZONE_RESETALL, q);
+
+	virtio_cread(vdev, struct virtio_blk_config,
+		     zoned.max_open_zones, &v);
+	blk_queue_max_open_zones(q, le32_to_cpu(v));
+
+	dev_info(&vdev->dev, "max open zones = %u\n", le32_to_cpu(v));
+
+	virtio_cread(vdev, struct virtio_blk_config,
+		     zoned.max_active_zones, &v);
+	blk_queue_max_active_zones(q, le32_to_cpu(v));
+
+	dev_info(&vdev->dev, "max active zones = %u\n", le32_to_cpu(v));
+
+	virtio_cread(vdev, struct virtio_blk_config,
+		     zoned.max_append_sectors, &v);
+	if (!v) {
+		dev_warn(&vdev->dev, "zero max_append_sectors reported\n");
+		return -ENODEV;
+	}
+	blk_queue_max_zone_append_sectors(q, le32_to_cpu(v));
+
+	dev_info(&vdev->dev, "max append sectors = %u\n", le32_to_cpu(v));
+
+	virtio_cread(vdev, struct virtio_blk_config,
+		     zoned.write_granularity, &v);
+	if (!v) {
+		dev_warn(&vdev->dev, "zero write granularity reported\n");
+		return -ENODEV;
+	}
+	blk_queue_physical_block_size(q, le32_to_cpu(v));
+	blk_queue_io_min(q, le32_to_cpu(v));
+
+	dev_info(&vdev->dev, "write granularity = %u\n", le32_to_cpu(v));
+
 	/*
 	 * virtio ZBD specification doesn't require zones to be a power of
 	 * two sectors in size, but the code in this driver expects that.
 	 */
-	virtio_cread(vdev, struct virtio_blk_config,
-		     zoned.zone_sectors, &v);
+	virtio_cread(vdev, struct virtio_blk_config, zoned.zone_sectors, &v);
 	if (v == 0 || !is_power_of_2(v)) {
 		dev_err(&vdev->dev,
 			"zoned device with non power of two zone size %u\n", v);
 		return -ENODEV;
 	}
+
+	dev_info(&vdev->dev, "zone sectors = %u\n", le32_to_cpu(v));
+	vblk->zone_sectors = le32_to_cpu(v);
 
 	if (virtio_has_feature(vdev, VIRTIO_BLK_F_DISCARD)) {
 		dev_warn(&vblk->vdev->dev,
@@ -765,7 +773,7 @@ static int virtblk_probe_zoned_device(struct virtio_device *vdev,
 		blk_queue_max_discard_sectors(q, 0);
 	}
 
-	return 0;
+	return blk_revalidate_disk_zones(vblk->disk, NULL);
 }
 
 #else
@@ -1434,14 +1442,17 @@ static int virtblk_probe(struct virtio_device *vdev)
 		blk_queue_max_write_zeroes_sectors(q, v ? v : UINT_MAX);
 	}
 
+	virtblk_update_capacity(vblk, false);
+	virtio_device_ready(vdev);
+
 	if (virtio_has_feature(vdev, VIRTIO_BLK_F_ZONED)) {
 		err = virtblk_probe_zoned_device(vdev, vblk, q);
 		if (err)
 			goto out_cleanup_disk;
 	}
 
-	virtblk_update_capacity(vblk, false);
-	virtio_device_ready(vdev);
+	dev_info(&vdev->dev, "blk config size: %zu\n",
+		sizeof(struct virtio_blk_config));
 
 	err = device_add_disk(&vdev->dev, vblk->disk, virtblk_attr_groups);
 	if (err)
