@@ -211,6 +211,8 @@ struct virtio_blk_outhdr {
  * Supported zoned device models.
  */
 
+/* Regular block device */
+#define VIRTIO_BLK_Z_NONE      0
 /* Host-managed zoned device */
 #define VIRTIO_BLK_Z_HM        1
 /* Host-aware zoned device */
