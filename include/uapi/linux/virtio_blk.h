@@ -188,6 +188,9 @@ struct virtio_blk_config {
 /* Reset zone command */
 #define VIRTIO_BLK_T_ZONE_RESET     24
 
+/* Reset All zones command */
+#define VIRTIO_BLK_T_ZONE_RESET_ALL 26
+
 #ifndef VIRTIO_BLK_NO_LEGACY
 /* Barrier before this op. */
 #define VIRTIO_BLK_T_BARRIER	0x80000000
@@ -217,18 +220,6 @@ struct virtio_blk_outhdr {
 #define VIRTIO_BLK_Z_HM        1
 /* Host-aware zoned device */
 #define VIRTIO_BLK_Z_HA        2
-
-/* ZBD Management Out ALL flag */
-#define VIRTIO_BLK_ZONED_FLAG_ALL	(1 << 0)
-
-/*
- * Header for VIRTIO_BLK_T_ZONE_OPEN, VIRTIO_BLK_T_ZONE_CLOSE,
- * VIRTIO_BLK_T_ZONE_RESET, VIRTIO_BLK_T_ZONE_FINISH requests.
- */
-struct virtio_blk_zone_mgmt_outhdr {
-	/* Zoned request flags */
-	__virtio32 flags;
-};
 
 /*
  * Zone descriptor. A part of VIRTIO_BLK_T_ZONE_REPORT command reply.

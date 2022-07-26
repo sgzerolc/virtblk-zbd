@@ -87,15 +87,7 @@ struct virtio_blk {
 
 struct virtblk_req {
 	/* Out header */
-	union {
-		struct virtio_blk_outhdr out_hdr;
-
-		/* The zone mgmt commands have an extended out header */
-		struct {
-			struct virtio_blk_outhdr out_hdr;
-			struct virtio_blk_zone_mgmt_outhdr zone_mgmt;
-		} zone_mgmt_out_hdr;
-	};
+	struct virtio_blk_outhdr out_hdr;
 
 	/* In header */
 	union {
@@ -114,7 +106,6 @@ struct virtblk_req {
 		} zone_append_in_hdr;
 	};
 
-	size_t out_hdr_len;
 	size_t in_hdr_len;
 
 	struct sg_table sg_table;
@@ -144,7 +135,7 @@ static int virtblk_add_req(struct virtqueue *vq, struct virtblk_req *vbr)
 	struct scatterlist out_hdr, in_hdr, *sgs[3];
 	unsigned int num_out = 0, num_in = 0;
 
-	sg_init_one(&out_hdr, &vbr->out_hdr, vbr->out_hdr_len);
+	sg_init_one(&out_hdr, &vbr->out_hdr, sizeof(vbr->out_hdr));
 	sgs[num_out++] = &out_hdr;
 
 	if (vbr->sg_table.nents) {
@@ -244,7 +235,6 @@ static blk_status_t virtblk_setup_cmd(struct virtio_device *vdev,
 				      struct request *req,
 				      struct virtblk_req *vbr)
 {
-	size_t out_hdr_len = sizeof(vbr->out_hdr);
 	size_t in_hdr_len = sizeof(vbr->status);
 	bool unmap = false;
 	u32 type;
@@ -275,20 +265,14 @@ static blk_status_t virtblk_setup_cmd(struct virtio_device *vdev,
 	case REQ_OP_ZONE_OPEN:
 		type = VIRTIO_BLK_T_ZONE_OPEN;
 		sector = blk_rq_pos(req);
-		vbr->zone_mgmt_out_hdr.zone_mgmt.flags = 0;
-		out_hdr_len = sizeof(vbr->zone_mgmt_out_hdr);
 		break;
 	case REQ_OP_ZONE_CLOSE:
 		type = VIRTIO_BLK_T_ZONE_CLOSE;
 		sector = blk_rq_pos(req);
-		vbr->zone_mgmt_out_hdr.zone_mgmt.flags = 0;
-		out_hdr_len = sizeof(vbr->zone_mgmt_out_hdr);
 		break;
 	case REQ_OP_ZONE_FINISH:
 		type = VIRTIO_BLK_T_ZONE_FINISH;
 		sector = blk_rq_pos(req);
-		vbr->zone_mgmt_out_hdr.zone_mgmt.flags = 0;
-		out_hdr_len = sizeof(vbr->zone_mgmt_out_hdr);
 		break;
 	case REQ_OP_ZONE_APPEND:
 		type = VIRTIO_BLK_T_ZONE_APPEND;
@@ -298,14 +282,9 @@ static blk_status_t virtblk_setup_cmd(struct virtio_device *vdev,
 	case REQ_OP_ZONE_RESET:
 		type = VIRTIO_BLK_T_ZONE_RESET;
 		sector = blk_rq_pos(req);
-		vbr->zone_mgmt_out_hdr.zone_mgmt.flags = 0;
-		out_hdr_len = sizeof(vbr->zone_mgmt_out_hdr);
 		break;
 	case REQ_OP_ZONE_RESET_ALL:
-		type = VIRTIO_BLK_T_ZONE_RESET;
-		vbr->zone_mgmt_out_hdr.zone_mgmt.flags =
-			cpu_to_virtio32(vdev, VIRTIO_BLK_ZONED_FLAG_ALL);
-		out_hdr_len = sizeof(vbr->zone_mgmt_out_hdr);
+		type = VIRTIO_BLK_T_ZONE_RESET_ALL;
 		break;
 	case REQ_OP_DRV_IN:
 		/* Out header already filled in, nothing to do */
@@ -316,7 +295,6 @@ static blk_status_t virtblk_setup_cmd(struct virtio_device *vdev,
 	}
 
 	/* Set fields for non-REQ_OP_DRV_IN request types */
-	vbr->out_hdr_len = out_hdr_len;
 	vbr->in_hdr_len = in_hdr_len;
 	vbr->out_hdr.type = cpu_to_virtio32(vdev, type);
 	vbr->out_hdr.sector = cpu_to_virtio64(vdev, sector);
@@ -576,7 +554,6 @@ static int virtblk_submit_zone_report(struct virtio_blk *vblk,
 		return PTR_ERR(req);
 
 	vbr = blk_mq_rq_to_pdu(req);
-	vbr->out_hdr_len = sizeof(vbr->out_hdr);
 	vbr->in_hdr_len = sizeof(vbr->status);
 	vbr->out_hdr.type = cpu_to_virtio32(vblk->vdev, VIRTIO_BLK_T_ZONE_REPORT);
 	vbr->out_hdr.sector = cpu_to_virtio64(vblk->vdev, sector);
@@ -809,7 +786,6 @@ static int virtblk_get_id(struct gendisk *disk, char *id_str)
 		return PTR_ERR(req);
 
 	vbr = blk_mq_rq_to_pdu(req);
-	vbr->out_hdr_len = sizeof(vbr->out_hdr);
 	vbr->in_hdr_len = sizeof(vbr->status);
 	vbr->out_hdr.type = cpu_to_virtio32(vblk->vdev, VIRTIO_BLK_T_GET_ID);
 	vbr->out_hdr.sector = 0;
