@@ -715,6 +715,7 @@ static int virtblk_probe_zoned_device(struct virtio_device *vdev,
 	 */
 	virtio_cread(vdev, struct virtio_blk_config,
 		     zoned.zone_sectors, &v);
+	pr_info("virtio_cread: zone size of device = %u\n", v);
 	if (v == 0 || !is_power_of_2(v)) {
 		dev_err(&vdev->dev,
 			"zoned device with non power of two zone size %u\n", v);
@@ -1448,6 +1449,7 @@ static int virtblk_probe(struct virtio_device *vdev)
 	virtio_device_ready(vdev);
 	
 	if (virtio_has_feature(vdev, VIRTIO_BLK_F_ZONED)) {
+		pr_info("guest os: has the zoned bit: %d\n",VIRTIO_BLK_F_ZONED); 
 		err = virtblk_probe_zoned_device(vdev, vblk, q);
 		if (err) {
 			dev_err(&vdev->dev, "virtblk: probing zoned device!\n");
