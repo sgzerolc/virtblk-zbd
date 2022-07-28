@@ -671,6 +671,7 @@ static int virtblk_probe_zoned_device(struct virtio_device *vdev,
 {
 	u32 v;
 	u8 model;
+	int ret;
 
 	virtio_cread(vdev, struct virtio_blk_config,
 		     zoned.model, &model);
@@ -709,14 +710,6 @@ static int virtblk_probe_zoned_device(struct virtio_device *vdev,
 
 	dev_info(&vdev->dev, "max active zones = %u\n", le32_to_cpu(v));
 
-	virtio_cread(vdev, struct virtio_blk_config,
-		     zoned.max_append_sectors, &v);
-	if (!v) {
-		dev_warn(&vdev->dev, "zero max_append_sectors reported\n");
-		return -ENODEV;
-	}
-	blk_queue_max_zone_append_sectors(q, le32_to_cpu(v));
-
 	dev_info(&vdev->dev, "max append sectors = %u\n", le32_to_cpu(v));
 
 	virtio_cread(vdev, struct virtio_blk_config,
@@ -750,7 +743,18 @@ static int virtblk_probe_zoned_device(struct virtio_device *vdev,
 		blk_queue_max_discard_sectors(q, 0);
 	}
 
-	return blk_revalidate_disk_zones(vblk->disk, NULL);
+	ret = blk_revalidate_disk_zones(vblk->disk, NULL);
+	if (!ret) {
+		virtio_cread(vdev, struct virtio_blk_config,
+			     zoned.max_append_sectors, &v);
+		if (!v) {
+			dev_warn(&vdev->dev, "zero max_append_sectors reported\n");
+			return -ENODEV;
+		}
+		blk_queue_max_zone_append_sectors(q, le32_to_cpu(v));
+	}
+
+	return ret;
 }
 
 #else
